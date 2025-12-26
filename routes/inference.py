@@ -3,8 +3,12 @@ import timm
 import time
 import torch
 from PIL import Image
+from opentelemetry import trace
+from utils.logs_collector import logger
 from config.prom_metrics import REQUEST_LATENCY, REQUEST_COUNT
-from fastapi import UploadFile, File, HTTPException, APIRouter
+from fastapi import UploadFile, File, HTTPException, APIRouter, Request
+
+tracer = trace.get_tracer(__name__)
 
 # Routers:
 router = APIRouter(prefix="/ml-services", tags=["Health"])
@@ -29,61 +33,116 @@ load_model()
 
 # IMAGE CLASSIFICATION API
 @router.post("/v1/get_inference")
-async def predict_image(file: UploadFile = File(...)):
+async def predict_image(
+    request: Request,
+    file: UploadFile = File(...)
+):
     endpoint = "/v1/get_inference"
-    method = "POST"
-    status_code = "500"   # default (in case of crash)
+    method = request.method
+    status_code = "500"
 
     start_time = time.time()
 
-    try:
-        # ---- Validate content type ----
-        if file.content_type not in {"image/jpeg", "image/png", "image/jpg"}:
-            status_code = "400"
-            raise HTTPException(status_code=400, detail="Invalid image type")
-
-        # ---- Read & decode image ----
-        try:
-            image_bytes = await file.read()
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except Exception:
-            status_code = "400"
-            raise HTTPException(status_code=400, detail="Invalid image file")
-
-        # ---- Preprocess ----
-        input_tensor = transforms(image).unsqueeze(0)
-
-        # ---- Inference ----
-        with torch.no_grad():
-            output = model(input_tensor)
-            probs = torch.softmax(output, dim=1)[0]
-
-        # ---- Top-5 predictions ----
-        top5_probs, top5_idxs = torch.topk(probs, k=5)
-
-        results = [
-            {
-                "class_id": int(idx),
-                "class_name": class_names[int(idx)].split(",")[0],
-                "confidence": round(float(prob) * 100, 2)
-            }
-            for prob, idx in zip(top5_probs, top5_idxs)
-        ]
-
-        status_code = "200"
-
-        return {
-            "status": "success",
-            "top_5_predictions": results
+    with tracer.start_as_current_span(
+        "image_classification",
+        attributes={
+            "http.method": method,
+            "http.route": endpoint,
+            "file.content_type": file.content_type
         }
+    ):
+        logger.info(
+            "image_inference_started",
+            extra={"endpoint": endpoint, "method": method}
+        )
 
-    finally:
-        # ---- Record metrics (always executed) ----
-        duration = time.time() - start_time
+        try:
+            # ---- Validate content type ----
+            if file.content_type not in {"image/jpeg", "image/png", "image/jpg"}:
+                status_code = "400"
+                logger.warning(
+                    "invalid_image_type",
+                    extra={
+                        "endpoint": endpoint,
+                        "content_type": file.content_type
+                    }
+                )
+                raise HTTPException(status_code=400, detail="Invalid image type")
 
-        REQUEST_LATENCY.labels(endpoint=endpoint).observe(duration)
-        REQUEST_COUNT.labels(
-            method=method,
-            endpoint=endpoint,
-            status=status_code
-        ).inc()
+            # ---- Read & decode image ----
+            try:
+                image_bytes = await file.read()
+                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            except Exception as e:
+                status_code = "400"
+                logger.exception(
+                    "image_decode_failed",
+                    extra={"endpoint": endpoint}
+                )
+                raise HTTPException(status_code=400, detail="Invalid image file")
+
+            # ---- Preprocess ----
+            input_tensor = transforms(image).unsqueeze(0)
+
+            # ---- Inference span ----
+            with tracer.start_as_current_span("model_inference"):
+                with torch.no_grad():
+                    output = model(input_tensor)
+                    probs = torch.softmax(output, dim=1)[0]
+
+            # ---- Top-5 predictions ----
+            top5_probs, top5_idxs = torch.topk(probs, k=5)
+
+            results = [
+                {
+                    "class_id": int(idx),
+                    "class_name": class_names[int(idx)].split(",")[0],
+                    "confidence": round(float(prob) * 100, 2)
+                }
+                for prob, idx in zip(top5_probs, top5_idxs)
+            ]
+
+            status_code = "200"
+
+            logger.info(
+                "image_inference_success",
+                extra={
+                    "endpoint": endpoint,
+                    "top1_class": results[0]["class_name"],
+                    "top1_confidence": results[0]["confidence"]
+                }
+            )
+
+            return {
+                "status": "success",
+                "top_5_predictions": results
+            }
+
+        except HTTPException:
+            raise
+
+        except Exception as e:
+            logger.exception(
+                "image_inference_failed",
+                extra={"endpoint": endpoint}
+            )
+            raise HTTPException(status_code=500, detail="Internal server error")
+
+        finally:
+            duration = time.time() - start_time
+
+            REQUEST_LATENCY.labels(endpoint=endpoint).observe(duration)
+            REQUEST_COUNT.labels(
+                method=method,
+                endpoint=endpoint,
+                status=status_code
+            ).inc()
+
+            logger.info(
+                "image_inference_completed",
+                extra={
+                    "endpoint": endpoint,
+                    "status": status_code,
+                    "latency_sec": round(duration, 4)
+                }
+            )
